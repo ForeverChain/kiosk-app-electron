@@ -41,6 +41,16 @@ const processBuffer = (buffer) => {
 
 if (isMainThread) {
     log.info("✅ Main process log initialized");
+    
+    // Prevent multiple instances
+    const gotTheLock = app.requestSingleInstanceLock();
+    
+    if (!gotTheLock) {
+        log.info("❌ Another instance is already running. Exiting...");
+        app.quit();
+        return;
+    }
+    
     function createWindow() {
         const kioskId = process.env.KIOSK_ID;
         const kioskMode = process.env.KIOSK_APP_MODE;
