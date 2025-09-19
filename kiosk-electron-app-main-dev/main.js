@@ -1,14 +1,13 @@
-const { app, BrowserWindow } = require("electron");
 const { Worker, isMainThread, workerData, parentPort } = require("worker_threads");
 const { SerialPort } = require("serialport");
 const ffi = require("ffi-napi");
 const axios = require("axios");
 const https = require("https");
-const log = require("electron-log");
 const path = require("path");
 
 // Configure logging before any log calls
 if (isMainThread) {
+    const log = require("electron-log");
     // Use custom log directory instead of default Electron userData
     const customLogDir = path.join(require('os').homedir(), 'AppData', 'Roaming', 'kiosk-eletron-app', 'logs');
     
@@ -40,6 +39,8 @@ const processBuffer = (buffer) => {
 };
 
 if (isMainThread) {
+    const { app, BrowserWindow } = require("electron");
+    const log = require("electron-log");
     log.info("✅ Main process log initialized");
 
     // Prevent multiple instances
