@@ -1,14 +1,16 @@
 const { app, BrowserWindow } = require("electron");
-const { Worker, isMainThread, workerData } = require("worker_threads");
+const { Worker, isMainThread, workerData, parentPort } = require("worker_threads");
 const { SerialPort } = require("serialport");
 const ffi = require("ffi-napi");
 const axios = require("axios");
 const https = require("https");
 const log = require("electron-log");
+const path = require("path");
 
+// --- Process card data ---
 const processBuffer = (buffer) => {
-    let startIndex = buffer.indexOf(0x02);
-    let endIndex = buffer.indexOf(0x03);
+    const startIndex = buffer.indexOf(0x02);
+    const endIndex = buffer.indexOf(0x03);
     if (startIndex !== -1 && endIndex !== -1 && startIndex < endIndex) {
         let cardData = buffer.slice(startIndex + 2, endIndex);
         cardData = cardData.filter((byte) => byte !== 82 && byte !== 95);
@@ -19,18 +21,18 @@ const processBuffer = (buffer) => {
     return "";
 };
 
-if (isMainThread) {
-    let mainWindow;
 
+if (isMainThread) {
     function createWindow() {
         const kioskId = process.env.KIOSK_ID;
         const kioskMode = process.env.KIOSK_APP_MODE;
 
-        mainWindow = new BrowserWindow({
+        const mainWindow = new BrowserWindow({
             width: 1080,
             height: 1920,
             fullscreen: true,
             autoHideMenuBar: true,
+            webPreferences: { nodeIntegration: false, contextIsolation: true },
         });
 
         mainWindow.webContents.session.clearCache().then(() => {
@@ -39,46 +41,40 @@ if (isMainThread) {
 
         mainWindow.loadURL(`http://139.150.71.249:5178/kiosk/login`);
 
-        // ---------- Serial Port with Auto-Retry ----------
-        let serialport;
-        let buffer = [];
-        let lastCardNumber = null;
-        let retryCount = 0;
-        const MAX_RETRY = 500;
+        // --- Banner handling ---
         let bannerShown = false;
-
         function showBanner(message) {
             if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.webContents) return;
-            if (bannerShown) return; // only show once
+            if (bannerShown) return;
 
             bannerShown = true;
-            const safeMessage = message.replace(/`/g, "\\`"); // escape backticks
+            const safeMessage = message.replace(/`/g, "\\`");
 
             mainWindow.webContents
                 .executeJavaScript(
                     `
         var banner = document.getElementById('kiosk-alert');
         if (!banner) {
-            banner = document.createElement('div');
-            banner.id = 'kiosk-alert';
-            banner.style.position = 'fixed';
-            banner.style.top = '0';
-            banner.style.left = '0';
-            banner.style.width = '100%';
-            banner.style.background = 'red';
-            banner.style.color = 'white';
-            banner.style.fontSize = '20px';
-            banner.style.textAlign = 'center';
-            banner.style.padding = '10px';
-            banner.style.zIndex = '9999';
-            document.body.appendChild(banner);
+          banner = document.createElement('div');
+          banner.id = 'kiosk-alert';
+          banner.style.position = 'fixed';
+          banner.style.top = '0';
+          banner.style.left = '0';
+          banner.style.width = '100%';
+          banner.style.background = 'red';
+          banner.style.color = 'white';
+          banner.style.fontSize = '20px';
+          banner.style.textAlign = 'center';
+          banner.style.padding = '10px';
+          banner.style.zIndex = '9999';
+          document.body.appendChild(banner);
         }
         banner.innerText = \`${safeMessage}\`;
-    `
+      `
                 )
                 .catch((err) => {
                     log.error("Failed to show banner:", err.message);
-                    bannerShown = false; // allow retry next time
+                    bannerShown = false;
                 });
         }
 
@@ -91,12 +87,19 @@ if (isMainThread) {
                     `
         var banner = document.getElementById('kiosk-alert');
         if (banner) banner.remove();
-    `
+      `
                 )
                 .catch((err) => log.warn("Failed to hide banner:", err.message));
 
             bannerShown = false;
         }
+
+        // --- Serial port with auto-retry ---
+        let serialport;
+        let buffer = [];
+        let lastCardNumber = null;
+        let retryCount = 0;
+        const MAX_RETRY = 500;
 
         function openSerialPort() {
             serialport = new SerialPort({
@@ -109,10 +112,10 @@ if (isMainThread) {
                 autoOpen: false,
             });
 
-            serialport.open((err) => {
+            serialport.open(async (err) => {
                 if (err) {
-                    log.error("❌ Failed to open COM5:", err.message);
-                    if (!bannerShown) showBanner(`❌ 포트 오류: COM5에 연결할 수 없습니다. USB 케이블 및 포트 연결을 확인해 주세요.`);
+                    log.error(`❌ Failed to open COM5: ${err.message}`);
+                    showBanner(`❌ 포트 오류: COM5에 연결할 수 없습니다. USB 케이블 및 포트 연결을 확인해 주세요.`);
                     retryOpen();
                 } else {
                     log.info("✅ Serial port is open!");
@@ -124,8 +127,6 @@ if (isMainThread) {
             serialport.on("data", async (data) => {
                 buffer = [...buffer, ...data];
                 const token = await mainWindow.webContents.executeJavaScript(`sessionStorage.getItem("token");`).catch(() => null);
-
-                log.info("buffer", buffer);
 
                 if (buffer.length === 12) {
                     const cardNumber = processBuffer(buffer);
@@ -157,7 +158,7 @@ if (isMainThread) {
         function retryOpen() {
             if (retryCount >= MAX_RETRY) {
                 log.error(`❌ Max retries reached (${MAX_RETRY}). Stop retrying.`);
-                showBanner(`❌ Serial port COM5 failed to open after ${MAX_RETRY} attempts.`);
+                showBanner(`❌ 포트 오류: COM5에 연결할 수 없습니다. USB 케이블 및 포트 연결을 확인해 주세요.`);
                 return;
             }
             retryCount++;
@@ -169,40 +170,60 @@ if (isMainThread) {
 
         openSerialPort();
 
-        // ---------- Printer Worker ----------
+        // --- Printer worker ---
         try {
             const printerWorker = new Worker(__filename, {
                 workerData: { kioskId, kioskMode },
             });
 
-            printerWorker.on("error", (err) => {
-                log.error("❌ Worker error:", err);
-                showBanner(`❌ Printer worker error: ${err.message}`);
+            // ✅ Forward logs from worker
+            printerWorker.on("message", (msg) => {
+                if (msg.type === "log") {
+                    if (log[msg.level]) {
+                        log[msg.level](`[Worker] ${msg.message}`);
+                    } else {
+                        log.info(`[Worker] ${msg.message}`);
+                    }
+                }
             });
 
-            printerWorker.on("exit", (code) => {
-                log.info("ℹ️ Worker exited with code:", code);
-            });
+            printerWorker.on("error", (err) => log.error("❌ Worker error:", err));
+            printerWorker.on("exit", (code) => log.info("ℹ️ Worker exited with code:", code));
         } catch (err) {
             log.error("❌ Failed to start worker:", err);
-            showBanner(`❌ Failed to start printer worker: ${err.message}`);
         }
 
-        app.setLoginItemSettings({
-            openAtLogin: true,
-            path: app.getPath("exe"),
-        });
+        app.setLoginItemSettings({ openAtLogin: true, path: app.getPath("exe") });
     }
 
-    app.whenReady().then(createWindow);
+    app.whenReady().then(() => {
+        log.transports.file.resolvePath = () =>
+            path.join(app.getPath("userData"), "logs/main.log");
+        log.transports.file.maxSize = 5 * 1024 * 1024; // 5 MB
+        log.transports.file.retainDays = 7;
+    
+        log.info("✅ Main process log initialized");
+        createWindow();
+    });
 } else {
+    // --- Worker thread: printer + heartbeat ---
     const { kioskId, kioskMode } = workerData;
 
-    const bixolonSDK = ffi.Library(kioskMode === "DEV" ? "C:\\BIXOLON\\BXLPAPI.dll" : process.resourcesPath + "\\BXLPAPI.dll", {
-        PrinterOpen: ["int", ["int", "string", "int", "int", "int", "int", "int"]],
-        GetPrinterCurrentStatus: ["int", []],
-        PrinterClose: ["int", []],
-    });
+    // ✅ Worker-side logging helper (sends messages to main)
+    function workerLog(level, message) {
+        if (parentPort) {
+            parentPort.postMessage({ type: "log", level, message });
+        }
+    }
+
+    const bixolonSDK = ffi.Library(
+        kioskMode === "DEV" ? "C:\\BIXOLON\\BXLPAPI.dll" : process.resourcesPath + "\\BXLPAPI.dll",
+        {
+            PrinterOpen: ["int", ["int", "string", "int", "int", "int", "int", "int"]],
+            GetPrinterCurrentStatus: ["int", []],
+            PrinterClose: ["int", []],
+        }
+    );
 
     let errorCount = 0;
     let zeroCount = 0;
@@ -210,17 +231,19 @@ if (isMainThread) {
 
     async function sendKioskHeartbeat() {
         try {
-            await axios.post("http://139.150.71.249:5178/api/v1/fmcs/kiosk/update/time", { kioskId, kioskStatus: 1 }, { httpsAgent: new https.Agent({ rejectUnauthorized: false }) });
+          await axios.post("http://139.150.71.249:5178/api/v1/fmcs/kiosk/update/time", { kioskId, kioskStatus: 1 }, { httpsAgent: new https.Agent({ rejectUnauthorized: false }) });
+          workerLog("info", "✅ Kiosk heartbeat sent");
         } catch (e) {
-            log.error("Send kiosk heartbeat error:", e.message);
+            workerLog("error", `Send kiosk heartbeat error: ${e.message}`);
         }
     }
 
     async function sendPrinterStatus(status) {
         try {
-            return await axios.post("http://139.150.71.249:5178/api/v1/fmcs/kiosk/update/time", { kioskId, kioskStatus: 1, printerStatus: status }, { httpsAgent: new https.Agent({ rejectUnauthorized: false }) });
+          await axios.post("http://139.150.71.249:5178/api/v1/fmcs/kiosk/update/time", { kioskId, kioskStatus: 1, printerStatus: status }, { httpsAgent: new https.Agent({ rejectUnauthorized: false }) });
+          workerLog("info", `✅ Printer status sent: ${status}`);
         } catch (e) {
-            log.error("Send printer status error:", e.message);
+            workerLog("error", `Send printer status error: ${e.message}`);
         }
     }
 
@@ -241,9 +264,7 @@ if (isMainThread) {
             } else if (status === 0) {
                 zeroCount++;
                 errorCount = 0;
-                if (status !== lastStatus || zeroCount <= 5) {
-                    if (zeroCount <= 5) await sendPrinterStatus(status);
-                }
+                if (status !== lastStatus || zeroCount <= 5) await sendPrinterStatus(status);
             } else {
                 errorCount = 0;
                 zeroCount = 0;
@@ -252,7 +273,7 @@ if (isMainThread) {
 
             lastStatus = status;
         } catch (err) {
-            log.error("Printer loop error:", err.message);
+            workerLog("error", `Printer loop error: ${err.message}`);
         } finally {
             setTimeout(printerLoop, 3000);
         }
@@ -262,12 +283,13 @@ if (isMainThread) {
         try {
             await sendKioskHeartbeat();
         } catch (err) {
-            log.error("Kiosk status loop error:", err.message);
+            workerLog("error", `Kiosk status loop error: ${err.message}`);
         } finally {
             setTimeout(kioskStatusLoop, 10000);
         }
     }
 
+    workerLog("info", "Worker started successfully ✅");
     printerLoop();
     kioskStatusLoop();
 }

@@ -1,10 +1,11 @@
 const { app, BrowserWindow } = require("electron");
-const { Worker, isMainThread, workerData } = require("worker_threads");
+const { Worker, isMainThread, workerData, parentPort } = require("worker_threads");
 const { SerialPort } = require("serialport");
 const ffi = require("ffi-napi");
 const axios = require("axios");
 const https = require("https");
 const log = require("electron-log");
+const path = require("path");
 
 // --- Process card data ---
 const processBuffer = (buffer) => {
@@ -19,6 +20,7 @@ const processBuffer = (buffer) => {
     }
     return "";
 };
+
 
 if (isMainThread) {
     function createWindow() {
@@ -174,6 +176,17 @@ if (isMainThread) {
                 workerData: { kioskId, kioskMode },
             });
 
+            // ✅ Forward logs from worker
+            printerWorker.on("message", (msg) => {
+                if (msg.type === "log") {
+                    if (log[msg.level]) {
+                        log[msg.level](`[Worker] ${msg.message}`);
+                    } else {
+                        log.info(`[Worker] ${msg.message}`);
+                    }
+                }
+            });
+
             printerWorker.on("error", (err) => log.error("❌ Worker error:", err));
             printerWorker.on("exit", (code) => log.info("ℹ️ Worker exited with code:", code));
         } catch (err) {
@@ -183,16 +196,34 @@ if (isMainThread) {
         app.setLoginItemSettings({ openAtLogin: true, path: app.getPath("exe") });
     }
 
-    app.whenReady().then(createWindow);
+    app.whenReady().then(() => {
+        log.transports.file.resolvePath = () =>
+            path.join(app.getPath("userData"), "logs/main.log");
+        log.transports.file.maxSize = 5 * 1024 * 1024; // 5 MB
+        log.transports.file.retainDays = 7;
+    
+        log.info("✅ Main process log initialized");
+        createWindow();
+    });
 } else {
     // --- Worker thread: printer + heartbeat ---
     const { kioskId, kioskMode } = workerData;
 
-    const bixolonSDK = ffi.Library(kioskMode === "DEV" ? "C:\\BIXOLON\\BXLPAPI.dll" : process.resourcesPath + "\\BXLPAPI.dll", {
-        PrinterOpen: ["int", ["int", "string", "int", "int", "int", "int", "int"]],
-        GetPrinterCurrentStatus: ["int", []],
-        PrinterClose: ["int", []],
-    });
+    // ✅ Worker-side logging helper (sends messages to main)
+    function workerLog(level, message) {
+        if (parentPort) {
+            parentPort.postMessage({ type: "log", level, message });
+        }
+    }
+
+    const bixolonSDK = ffi.Library(
+        kioskMode === "DEV" ? "C:\\BIXOLON\\BXLPAPI.dll" : process.resourcesPath + "\\BXLPAPI.dll",
+        {
+            PrinterOpen: ["int", ["int", "string", "int", "int", "int", "int", "int"]],
+            GetPrinterCurrentStatus: ["int", []],
+            PrinterClose: ["int", []],
+        }
+    );
 
     let errorCount = 0;
     let zeroCount = 0;
@@ -200,17 +231,27 @@ if (isMainThread) {
 
     async function sendKioskHeartbeat() {
         try {
-            await axios.post("https://next.xi.co.kr/api/v2/fmcs/kiosk/update/time", { kioskId, kioskStatus: 1 }, { httpsAgent: new https.Agent({ rejectUnauthorized: false }) });
+            await axios.post(
+                "https://next.xi.co.kr/api/v2/fmcs/kiosk/update/time",
+                { kioskId, kioskStatus: 1 },
+                { httpsAgent: new https.Agent({ rejectUnauthorized: false }) }
+            );
+            workerLog("info", "✅ Kiosk heartbeat sent");
         } catch (e) {
-            log.error("Send kiosk heartbeat error:", e.message);
+            workerLog("error", `Send kiosk heartbeat error: ${e.message}`);
         }
     }
 
     async function sendPrinterStatus(status) {
         try {
-            await axios.post("https://next.xi.co.kr/api/v2/fmcs/kiosk/update/time", { kioskId, kioskStatus: 1, printerStatus: status }, { httpsAgent: new https.Agent({ rejectUnauthorized: false }) });
+            await axios.post(
+                "https://next.xi.co.kr/api/v2/fmcs/kiosk/update/time",
+                { kioskId, kioskStatus: 1, printerStatus: status },
+                { httpsAgent: new https.Agent({ rejectUnauthorized: false }) }
+            );
+            workerLog("info", `✅ Printer status sent: ${status}`);
         } catch (e) {
-            log.error("Send printer status error:", e.message);
+            workerLog("error", `Send printer status error: ${e.message}`);
         }
     }
 
@@ -240,7 +281,7 @@ if (isMainThread) {
 
             lastStatus = status;
         } catch (err) {
-            log.error("Printer loop error:", err.message);
+            workerLog("error", `Printer loop error: ${err.message}`);
         } finally {
             setTimeout(printerLoop, 3000);
         }
@@ -250,12 +291,13 @@ if (isMainThread) {
         try {
             await sendKioskHeartbeat();
         } catch (err) {
-            log.error("Kiosk status loop error:", err.message);
+            workerLog("error", `Kiosk status loop error: ${err.message}`);
         } finally {
             setTimeout(kioskStatusLoop, 10000);
         }
     }
 
+    workerLog("info", "Worker started successfully ✅");
     printerLoop();
     kioskStatusLoop();
 }
