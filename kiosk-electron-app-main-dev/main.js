@@ -7,6 +7,24 @@ const https = require("https");
 const log = require("electron-log");
 const path = require("path");
 
+// Configure logging before any log calls
+if (isMainThread) {
+    // Use custom log directory instead of default Electron userData
+    const customLogDir = path.join(require('os').homedir(), 'AppData', 'Roaming', 'kiosk-eletron-app', 'logs');
+    
+    // Ensure the custom log directory exists
+    if (!require('fs').existsSync(customLogDir)) {
+        require('fs').mkdirSync(customLogDir, { recursive: true });
+    }
+    
+    // Set the log directory and filename separately
+    log.transports.file.resolvePathFn = () => path.join(customLogDir, "main.log");
+    log.transports.file.maxSize = 5 * 1024 * 1024; // 5 MB
+    log.transports.file.retainDays = 7;
+    console.log("Main thread log file path:", path.join(customLogDir, "main.log"));
+}
+
+
 // --- Process card data ---
 const processBuffer = (buffer) => {
     const startIndex = buffer.indexOf(0x02);
@@ -21,8 +39,8 @@ const processBuffer = (buffer) => {
     return "";
 };
 
-
 if (isMainThread) {
+    log.info("✅ Main process log initialized");
     function createWindow() {
         const kioskId = process.env.KIOSK_ID;
         const kioskMode = process.env.KIOSK_APP_MODE;
@@ -176,16 +194,7 @@ if (isMainThread) {
                 workerData: { kioskId, kioskMode },
             });
 
-            // ✅ Forward logs from worker
-            printerWorker.on("message", (msg) => {
-                if (msg.type === "log") {
-                    if (log[msg.level]) {
-                        log[msg.level](`[Worker] ${msg.message}`);
-                    } else {
-                        log.info(`[Worker] ${msg.message}`);
-                    }
-                }
-            });
+            // Worker logs are now handled directly by electron-log
 
             printerWorker.on("error", (err) => log.error("❌ Worker error:", err));
             printerWorker.on("exit", (code) => log.info("ℹ️ Worker exited with code:", code));
@@ -197,24 +206,50 @@ if (isMainThread) {
     }
 
     app.whenReady().then(() => {
-        log.transports.file.resolvePath = () =>
-            path.join(app.getPath("userData"), "logs/main.log");
-        log.transports.file.maxSize = 5 * 1024 * 1024; // 5 MB
-        log.transports.file.retainDays = 7;
-    
-        log.info("✅ Main process log initialized");
+  
         createWindow();
     });
 } else {
     // --- Worker thread: printer + heartbeat ---
+    console.log("Worker thread started");
+    
     const { kioskId, kioskMode } = workerData;
+    console.log("Worker data:", { kioskId, kioskMode });
+    
+    const fs = require('fs');
+    const os = require('os');
 
-    // ✅ Worker-side logging helper (sends messages to main)
+    // Simple file logging for worker thread - use same path as main thread
+    const logDir = path.join(os.homedir(), 'AppData', 'Roaming', 'kiosk-eletron-app', 'logs');
+    const logFile = path.join(logDir, 'main.log');
+    
+    console.log("Log directory:", logDir);
+    console.log("Log file:", logFile);
+    
+    // Ensure log directory exists
+    if (!fs.existsSync(logDir)) {
+        console.log("Creating log directory");
+        fs.mkdirSync(logDir, { recursive: true });
+    }
+    
     function workerLog(level, message) {
-        if (parentPort) {
-            parentPort.postMessage({ type: "log", level, message });
+        console.log("workerLog called with:", level, message);
+        const timestamp = new Date().toISOString();
+        const logEntry = `[${timestamp}] [${level}] ${message}\n`;
+        
+        try {
+            console.log("Writing to log file:", logFile);
+            console.log("Log entry:", logEntry);
+            fs.appendFileSync(logFile, logEntry);
+            console.log("Successfully wrote to log file");
+        } catch (error) {
+            console.error("Error writing to log file:", error);
         }
     }
+    
+    console.log("About to call workerLog");
+    workerLog("info", "Worker started successfully ✅");
+    console.log("Called workerLog");
 
     const bixolonSDK = ffi.Library(
         kioskMode === "DEV" ? "C:\\BIXOLON\\BXLPAPI.dll" : process.resourcesPath + "\\BXLPAPI.dll",
@@ -231,8 +266,8 @@ if (isMainThread) {
 
     async function sendKioskHeartbeat() {
         try {
-          await axios.post("http://139.150.71.249:5178/api/v1/fmcs/kiosk/update/time", { kioskId, kioskStatus: 1 }, { httpsAgent: new https.Agent({ rejectUnauthorized: false }) });
-          workerLog("info", "✅ Kiosk heartbeat sent");
+            await axios.post("http://139.150.71.249:5178/api/v1/fmcs/kiosk/update/time", { kioskId, kioskStatus: 1 }, { httpsAgent: new https.Agent({ rejectUnauthorized: false }) });
+            workerLog("info", "✅ Kiosk heartbeat sent");
         } catch (e) {
             workerLog("error", `Send kiosk heartbeat error: ${e.message}`);
         }
@@ -240,8 +275,8 @@ if (isMainThread) {
 
     async function sendPrinterStatus(status) {
         try {
-          await axios.post("http://139.150.71.249:5178/api/v1/fmcs/kiosk/update/time", { kioskId, kioskStatus: 1, printerStatus: status }, { httpsAgent: new https.Agent({ rejectUnauthorized: false }) });
-          workerLog("info", `✅ Printer status sent: ${status}`);
+            await axios.post("http://139.150.71.249:5178/api/v1/fmcs/kiosk/update/time", { kioskId, kioskStatus: 1, printerStatus: status }, { httpsAgent: new https.Agent({ rejectUnauthorized: false }) });
+            workerLog("info", `✅ Printer status sent: ${status}`);
         } catch (e) {
             workerLog("error", `Send printer status error: ${e.message}`);
         }
